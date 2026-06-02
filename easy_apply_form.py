@@ -32,9 +32,14 @@ from chrome_cdp import check_cdp_available, connect_browser_over_cdp, get_cdp_ur
 
 # -- Easy Apply button selectors on the job detail page -----------------------
 EASY_APPLY_SELECTORS = [
+    '[data-automation="job-detail-apply"]',   # JobsDB "Quick apply" <a> link
     '[data-automation="easy-apply-btn"]',
+    'a:has-text("Quick apply")',
+    'a:has-text("Quick Apply")',
+    'a:has-text("Easy Apply")',
     'button:has-text("Easy Apply")',
     'button:has-text("Quick Apply")',
+    'button:has-text("Quick apply")',
     '[data-testid*="easy-apply" i]',
     '[data-testid*="quick-apply" i]',
 ]
@@ -77,6 +82,8 @@ SCREENING_ANSWERS: dict[str, str | list[str]] = {
 
      "How would you rate your": ["Writes proficiently in a professional setting","Speaks proficiently in a professional setting"],
      "Which of the following programming languages": ["Python"],
+     "programming languages": ["Python"],
+     "languages are you experienced": ["Python"],
     
 }
 
@@ -187,10 +194,31 @@ def _detect_page_type(page) -> str:
     if "review and submit" in title:
         return "submit"
 
+    # Check for step indicator elements (JobsDB multi-step form)
+    step_info = page.evaluate("""() => {
+        const steps = document.querySelectorAll('[class*="step"], [data-testid*="step"]');
+        const activeStep = document.querySelector('[class*="active"], [aria-current="step"]');
+        const activeText = activeStep ? activeStep.textContent.trim().toLowerCase() : '';
+        return {stepCount: steps.length, activeText: activeText.substring(0, 50)};
+    }""")
+    if step_info['activeText']:
+        at = step_info['activeText']
+        if "document" in at or "resume" in at:
+            return "documents"
+        if "question" in at or "employer" in at:
+            return "screening"
+        if "profile" in at:
+            return "profile"
+        if "review" in at or "submit" in at:
+            return "submit"
+
     # Body-text fallback
     body = _safe_body_text(page).lower()
 
-    if "resume" in body and ("cover letter" in body or "choose" in body):
+    # Documents page: look for resume upload or "choose documents" in body
+    if "resume" in body and ("cover letter" in body or "choose" in body or "upload" in body):
+        return "documents"
+    if "choose documents" in body and ("upload" in body or "resume" in body):
         return "documents"
 
     if any(kw in body for kw in ["screening question", "employer question",
@@ -206,6 +234,32 @@ def _detect_page_type(page) -> str:
            "by submitting"]):
         return "submit"
 
+    # Last resort: check if there's a Continue button + form elements
+    has_continue = False
+    for sel in CONTINUE_SELECTORS:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=500):
+                has_continue = True
+                break
+        except Exception:
+            continue
+    
+    if has_continue:
+        # Has Continue button but couldn't detect page type
+        # Check form elements to guess
+        form_counts = page.evaluate("""() => {
+            return {
+                selects: document.querySelectorAll('select').length,
+                radios: document.querySelectorAll('input[type=radio]').length,
+                fieldsets: document.querySelectorAll('fieldset').length,
+            };
+        }""")
+        if form_counts['radios'] > 3 or form_counts['fieldsets'] > 1:
+            return "screening"  # likely a screening questions page
+        if form_counts['selects'] > 0 and form_counts['radios'] > 0:
+            return "documents"  # likely the documents page with resume picker
+
     return "unknown"
 
 
@@ -213,8 +267,26 @@ def _detect_page_type(page) -> str:
 #  Click Easy Apply on job detail page
 # ---------------------------------------------------------------------------
 
+def _find_easy_apply_href(page, timeout_ms: int = 5000) -> str | None:
+    """Find the Easy/Quick Apply element and return its href (if <a>) or None."""
+    for sel in EASY_APPLY_SELECTORS:
+        try:
+            el = page.locator(sel).first
+            if el.is_visible(timeout=timeout_ms):
+                href = el.get_attribute("href")
+                tag = el.evaluate("el => el.tagName")
+                print(f"  [Easy Apply] Found: {sel} (tag={tag}, href={href})")
+                if href:
+                    # It's a link -- return the href so we can navigate directly
+                    return href
+                return ""  # button (no href), will need click
+        except Exception:
+            continue
+    return None  # not found
+
+
 def _click_easy_apply(page, timeout_ms: int = 5000) -> bool:
-    """Find and click the Easy Apply button on the job detail page."""
+    """Find and click the Easy Apply button on the job detail page (button-only)."""
     for sel in EASY_APPLY_SELECTORS:
         try:
             btn = page.locator(sel).first
@@ -250,6 +322,35 @@ def navigate_and_click_easy_apply(page, job_url: str) -> str:
         print("  Already applied.")
         return ""
 
+    # Try to find the Easy Apply element and check if it's a link or button
+    href = _find_easy_apply_href(page)
+    if href is None:
+        print("  No Easy Apply button found on job detail page.")
+        return ""
+
+    if href:
+        # It's an <a> link -- navigate directly to the apply URL (most reliable)
+        if href.startswith("/"):
+            apply_url = f"{BASE_URL}{href}"
+        elif href.startswith("http"):
+            apply_url = href
+        else:
+            apply_url = f"{BASE_URL}/{href}"
+        print(f"  Navigating directly to apply URL: {apply_url}")
+        try:
+            page.goto(apply_url, wait_until="domcontentloaded", timeout=30_000)
+        except Exception as exc:
+            print(f"  Apply page navigation error: {exc}")
+            return ""
+        time.sleep(2)
+        apply_url_final = page.url
+        if "/apply" in apply_url_final:
+            print(f"  Apply form loaded: {apply_url_final}")
+            return apply_url_final
+        print(f"  Unexpected URL after apply navigation: {apply_url_final}")
+        return apply_url_final if "/apply" in apply_url_final else ""
+
+    # It's a <button> -- click and wait for redirect
     clicked = _click_easy_apply(page)
     if not clicked:
         print("  No Easy Apply button found on job detail page.")
@@ -483,34 +584,67 @@ def _match_screening_answer(question_text: str) -> str | list[str] | None:
 def _find_select_for_question(page, question_text: str):
     """Given a question label text, find the associated <select> element.
 
-    Only returns a <select> that is a direct sibling of the matching label,
-    never falls back to an arbitrary visible select on the page.
+    Uses the actual JobsDB DOM structure discovered via diagnostics:
+      <label for="question-HK_Q_xxx_V_1">
+        <span><strong>Question text?</strong></span>
+      </label>
+      ...
+      <select id="question-HK_Q_xxx_V_1">...</select>
+
+    Strategy (in order of reliability):
+      1. Find <label> with matching text -> use its `for` attr -> getElementById
+      2. Find matching label -> walk up to question container -> find select inside
+      3. No dangerous "any visible select" fallback (prevents wrong matches)
     """
     q_lower = question_text.lower().strip()
-    for el in page.locator("label, legend, span").all():
+
+    # Strategy 1: label[for] -> select[id]  (most reliable)
+    for lbl in page.locator("label[for]").all():
         try:
-            txt = _safe_text(el, timeout_ms=300)
+            txt = _safe_text(lbl, timeout_ms=300)
         except Exception:
             continue
         if not txt or len(txt) < 5:
             continue
-        if q_lower[:40] in txt.lower() or txt.lower()[:40] in q_lower:
-            # Found a matching label -- look for a <select> nearby
-            parent = el.locator("..")
-            sel = parent.locator("select").first
-            try:
-                if sel.is_visible(timeout=500):
-                    return sel
-            except Exception:
-                pass
-            # Try grandparent
-            grandparent = el.locator("../..")
-            sel = grandparent.locator("select").first
-            try:
-                if sel.is_visible(timeout=500):
-                    return sel
-            except Exception:
-                pass
+        txt_lower = txt.lower().strip()
+        if q_lower[:40] in txt_lower or txt_lower[:40] in q_lower:
+            for_attr = lbl.get_attribute("for")
+            if for_attr:
+                sel = page.locator(f"select#{for_attr}").first
+                try:
+                    if sel.is_visible(timeout=500):
+                        return sel
+                except Exception:
+                    pass
+
+    # Strategy 2: matching label -> walk up to container with _9zha26t class ->
+    # find select inside (JobsDB question container class)
+    for lbl in page.locator("label").all():
+        try:
+            txt = _safe_text(lbl, timeout_ms=300)
+        except Exception:
+            continue
+        if not txt or len(txt) < 5:
+            continue
+        txt_lower = txt.lower().strip()
+        if q_lower[:40] in txt_lower or txt_lower[:40] in q_lower:
+            # Walk up to find a container that holds both the label and a select
+            for levels_up in range(1, 5):
+                ancestor = lbl.locator("../" * levels_up)
+                sel = ancestor.locator("select").first
+                try:
+                    if sel.is_visible(timeout=300):
+                        # Verify this select is NOT inside the label itself
+                        sel_id = sel.get_attribute("id") or ""
+                        if sel_id and sel_id != (lbl.get_attribute("for") or "___"):
+                            # Different select - likely the right one if it's a sibling container
+                            return sel
+                        elif not sel_id:
+                            return sel
+                except Exception:
+                    continue
+
+    # No fallback to "any visible select" - that caused wrong matches
     return None
 
 
@@ -539,7 +673,11 @@ def _is_question_in_fieldset(page, question_text: str) -> bool:
 
 
 def _answer_select_question(page, question_text: str, answer: str):
-    """Answer a screening question that uses a <select> dropdown."""
+    """Answer a screening question that uses a <select> dropdown.
+
+    If no option matches the preset answer, falls back to picking the
+    last option (the highest/most value).
+    """
     prefix = question_text[:55] + "..." if len(question_text) > 55 else question_text
     print(f"    Q: {prefix}")
     print(f"    A: {answer}")
@@ -563,7 +701,19 @@ def _answer_select_question(page, question_text: str, answer: str):
         except Exception:
             continue
 
-    print(f"      [WARN] No option matching '{answer}'")
+    # Fallback: pick the last option with a non-empty value
+    print(f"      [WARN] No option matching '{answer}' - picking last option")
+    for opt in reversed(options):
+        try:
+            opt_val = opt.get_attribute("value") or ""
+            opt_text = _safe_text(opt, timeout_ms=200)
+            if opt_val and opt_text:
+                sel.select_option(value=opt_val)
+                print(f"      Last-option fallback: {opt_text[:50]}")
+                time.sleep(0.3)
+                return
+        except Exception:
+            continue
 
 
 def _answer_question(page, question_text: str, answer: str | list[str]):
@@ -624,123 +774,98 @@ def _answer_question(page, question_text: str, answer: str | list[str]):
 def _find_checkbox_groups(page) -> list[dict]:
     """Find groups of standalone checkboxes (not inside fieldsets) with their question text.
 
-    Returns a list of dicts: {question_text, checkboxes: [element, ...]}
+    Groups checkboxes by their `name` attribute (since JobsDB uses empty `value` attrs
+    and identifies checkboxes by their label text instead).
+
+    Returns a list of dicts: {question_text, name, checkbox_count}
+    The checkboxes can be re-located via page.locator(f'input[type="checkbox"][name="{name}"]')
     """
-    groups = []
-
-    # Collect all visible checkbox inputs
-    checkboxes = []
-    for cb in page.locator('input[type="checkbox"]:visible').all():
-        try:
-            if cb.is_visible(timeout=300):
-                checkboxes.append(cb)
-        except Exception:
-            continue
-
-    if not checkboxes:
-        return groups
-
-    # Group checkboxes by their common parent container
-    # For each checkbox, find the nearest ancestor that contains multiple checkboxes
-    seen_parents = set()
-    for cb in checkboxes:
-        try:
-            # Check if this checkbox is inside a fieldset (skip those)
-            in_fieldset = cb.evaluate("""el => {
-                let p = el.parentElement;
-                while (p) {
-                    if (p.tagName === 'FIELDSET') return true;
-                    p = p.parentElement;
-                }
-                return false;
-            }""")
-            if in_fieldset:
-                continue
-
-            # Find the container that holds sibling checkboxes
-            container = cb.evaluate("""el => {
-                let p = el.parentElement;
-                while (p) {
-                    const cbs = p.querySelectorAll('input[type="checkbox"]');
-                    if (cbs.length >= 1) {
-                        // Return a unique identifier for this container
-                        return p.outerHTML.substring(0, 120);
-                    }
-                    p = p.parentElement;
-                    if (p && p.tagName === 'BODY') break;
-                }
-                return null;
-            }""")
-            if container and container not in seen_parents:
-                seen_parents.add(container)
-
-                # Get the question text from the nearest label/legend/span above the group
-                q_text = cb.evaluate("""el => {
-                    let p = el.parentElement;
-                    for (let i = 0; i < 6; i++) {
-                        if (!p) break;
-                        // Look for a label, legend, or heading sibling/ancestor
-                        const label = p.querySelector('label, legend, h3, h4, span[class*="label"], [class*="question"]');
-                        if (label && label.textContent.trim().length > 10) {
-                            return label.textContent.trim().substring(0, 200);
+    # Use JavaScript to find all checkbox groups grouped by name
+    group_info = page.evaluate("""() => {
+        const groups = {};
+        const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+        
+        checkboxes.forEach(cb => {
+            // Skip if inside a fieldset
+            let inFieldset = false;
+            let p = cb.parentElement;
+            while (p) {
+                if (p.tagName === 'FIELDSET') { inFieldset = true; break; }
+                p = p.parentElement;
+            }
+            if (inFieldset) return;
+            
+            // Skip if not visible
+            if (cb.offsetParent === null) return;
+            
+            const name = cb.name;
+            if (!name) return;
+            
+            if (!groups[name]) {
+                // Find question text for this group
+                let questionText = '';
+                let ancestor = cb.parentElement;
+                for (let i = 0; i < 8 && ancestor; i++) {
+                    // Look for a label/legend/span that describes this group
+                    const candidates = ancestor.querySelectorAll('label, legend, span, h3, h4');
+                    for (const c of candidates) {
+                        const txt = c.textContent.trim();
+                        // Question text is usually longer and doesn't contain a checkbox
+                        if (txt.length > 15 && !c.querySelector('input[type="checkbox"]')) {
+                            questionText = txt.substring(0, 200);
+                            break;
                         }
-                        // Check previous sibling elements
-                        let prev = p.previousElementSibling;
-                        for (let j = 0; j < 3 && prev; j++) {
-                            const txt = prev.textContent.trim();
-                            if (txt.length > 10 && txt.length < 300) {
-                                return txt;
-                            }
-                            prev = prev.previousElementSibling;
-                        }
-                        p = p.parentElement;
                     }
-                    return '';
-                }""")
+                    if (questionText) break;
+                    ancestor = ancestor.parentElement;
+                }
+                
+                groups[name] = {
+                    name: name,
+                    question_text: questionText,
+                    count: 0,
+                    labels: []
+                };
+            }
+            
+            groups[name].count++;
+            // Collect label text for this checkbox
+            const label = cb.closest('label');
+            if (label) {
+                groups[name].labels.push(label.textContent.trim().substring(0, 60));
+            }
+        });
+        
+        return Object.values(groups);
+    }""")
 
-                # Get all checkboxes in this container
-                group_cbs = []
-                for other_cb in checkboxes:
-                    try:
-                        other_container = other_cb.evaluate("""el => {
-                            let p = el.parentElement;
-                            while (p) {
-                                const cbs = p.querySelectorAll('input[type="checkbox"]');
-                                if (cbs.length >= 1) return p.outerHTML.substring(0, 120);
-                                p = p.parentElement;
-                                if (p && p.tagName === 'BODY') break;
-                            }
-                            return null;
-                        }""")
-                        if other_container == container:
-                            group_cbs.append(other_cb)
-                    except Exception:
-                        continue
+    results = []
+    for g in group_info:
+        if g['count'] > 0 and g['question_text']:
+            results.append({
+                "question_text": g['question_text'],
+                "name": g['name'],
+                "checkbox_count": g['count'],
+                "labels": g['labels'],
+            })
 
-                if q_text and group_cbs:
-                    groups.append({
-                        "question_text": q_text,
-                        "checkboxes": group_cbs,
-                    })
-        except Exception:
-            continue
-
-    return groups
-
-
-def _is_checkbox_group_answered(checkboxes) -> bool:
-    """Check if any checkbox in the group is already checked."""
-    for cb in checkboxes:
-        try:
-            if cb.is_checked():
-                return True
-        except Exception:
-            continue
-    return False
+    return results
 
 
-def _answer_checkbox_group(page, question_text: str, answers: list[str]):
-    """Click checkboxes matching the answer list for a standalone checkbox group."""
+def _is_checkbox_group_answered(page, name: str) -> bool:
+    """Check if any checkbox with the given name is already checked."""
+    try:
+        checked = page.locator(f'input[type="checkbox"][name="{name}"]:checked')
+        return checked.count() > 0
+    except Exception:
+        return False
+
+
+def _answer_checkbox_group(page, name: str, question_text: str, answers: list[str]):
+    """Click checkboxes matching the answer list for a checkbox group identified by name.
+
+    Since JobsDB checkboxes have empty value="" attributes, we match by label text.
+    """
     prefix = question_text[:55] + "..." if len(question_text) > 55 else question_text
     print(f"    Q: {prefix}")
     print(f"    A: {answers} (checkbox)")
@@ -748,25 +873,29 @@ def _answer_checkbox_group(page, question_text: str, answers: list[str]):
     for ans_text in answers:
         clicked = False
 
-        # Strategy 1: click a label containing the answer text
-        try:
-            locator = page.locator(f'label:has-text("{ans_text}")').first
-            if locator.is_visible(timeout=1500):
-                locator.click()
-                print(f"      Checked: {ans_text[:50]}")
-                clicked = True
-        except Exception:
-            pass
+        # Strategy 1: find a <label> within the checkbox group whose text matches,
+        # then click it (the label click toggles the associated checkbox)
+        cbs = page.locator(f'input[type="checkbox"][name="{name}"]').all()
+        for cb in cbs:
+            try:
+                label = cb.locator("xpath=ancestor::label")
+                if label.count() > 0:
+                    lbl_text = _safe_text(label.first, timeout_ms=200)
+                    if ans_text.lower() in lbl_text.lower():
+                        label.first.click()
+                        print(f"      Checked: {ans_text[:50]}")
+                        clicked = True
+                        break
+            except Exception:
+                continue
 
-        # Strategy 2: click checkbox by value attribute
+        # Strategy 2: click a label containing the answer text (page-wide)
         if not clicked:
             try:
-                inp = page.locator(
-                    f'input[type="checkbox"][value*="{ans_text[:30]}" i]'
-                ).first
-                if inp.is_visible(timeout=800):
-                    inp.click()
-                    print(f"      Checked (via value): {ans_text[:50]}")
+                locator = page.locator(f'label:has-text("{ans_text}")').first
+                if locator.is_visible(timeout=1500):
+                    locator.click()
+                    print(f"      Checked (label): {ans_text[:50]}")
                     clicked = True
             except Exception:
                 pass
@@ -777,7 +906,7 @@ def _answer_checkbox_group(page, question_text: str, answers: list[str]):
                 el = page.locator(f'text="{ans_text}"').first
                 if el.is_visible(timeout=800):
                     el.click()
-                    print(f"      Checked (via text): {ans_text[:50]}")
+                    print(f"      Checked (text): {ans_text[:50]}")
                     clicked = True
             except Exception:
                 pass
@@ -885,10 +1014,10 @@ def _handle_screening_questions_page(page) -> bool:
             for group in cb_groups:
                 gq = group["question_text"].lower().strip()
                 if q_text.lower().strip()[:30] in gq or gq[:30] in q_text.lower().strip():
-                    if _is_checkbox_group_answered(group["checkboxes"]):
+                    if _is_checkbox_group_answered(page, group["name"]):
                         print(f"    Q: {q_text[:55]}... - checkbox already answered")
                     else:
-                        _answer_checkbox_group(page, q_text, answer)
+                        _answer_checkbox_group(page, group["name"], q_text, answer)
                     answered += 1
                     break
             else:
@@ -949,15 +1078,15 @@ def _handle_screening_questions_page(page) -> bool:
     cb_groups = _find_checkbox_groups(page)
     for group in cb_groups:
         gq = group["question_text"]
-        if _is_checkbox_group_answered(group["checkboxes"]):
+        if _is_checkbox_group_answered(page, group["name"]):
             continue
         answer = _match_screening_answer(gq)
         if answer and isinstance(answer, list):
-            _answer_checkbox_group(page, gq, answer)
+            _answer_checkbox_group(page, group["name"], gq, answer)
             answered += len(answer)
         elif answer:
             # Single answer matched a checkbox group -- click first matching checkbox
-            _answer_checkbox_group(page, gq, [answer] if isinstance(answer, str) else answer)
+            _answer_checkbox_group(page, group["name"], gq, [answer] if isinstance(answer, str) else answer)
             answered += 1
 
     # Fallback: text-node scan (last resort)
@@ -992,8 +1121,8 @@ def _handle_screening_questions_page(page) -> bool:
                         for group in cb_groups:
                             gq = group["question_text"].lower().strip()
                             if line.lower().strip()[:30] in gq or gq[:30] in line.lower().strip():
-                                if not _is_checkbox_group_answered(group["checkboxes"]):
-                                    _answer_checkbox_group(page, line, answer)
+                                if not _is_checkbox_group_answered(page, group["name"]):
+                                    _answer_checkbox_group(page, group["name"], line, answer)
                                 answered += 1
                                 matched_cb = True
                                 break
@@ -1003,6 +1132,85 @@ def _handle_screening_questions_page(page) -> bool:
                     else:
                         _answer_question(page, line, answer)
                         answered += 1
+
+    # --- Final fallback: pick last option for any remaining unanswered questions ---
+    print("    Fallback: picking last option for remaining unanswered questions...")
+
+    # Unanswered selects
+    for sel in page.locator("select:visible").all():
+        try:
+            if _is_select_already_answered(sel):
+                continue
+            sel_html = sel.evaluate("el => el.outerHTML.substring(0, 80)")
+            if sel_html in answered_selects:
+                continue
+            options = sel.locator("option").all()
+            # Find the last option with a non-empty value (skip placeholder at index 0)
+            last_valid = None
+            for opt in reversed(options):
+                try:
+                    opt_val = opt.get_attribute("value") or ""
+                    opt_text = _safe_text(opt, timeout_ms=200)
+                    if opt_val and opt_text:
+                        last_valid = (opt_val, opt_text)
+                        break
+                except Exception:
+                    continue
+            if last_valid:
+                sel.select_option(value=last_valid[0])
+                print(f"      Last-option fallback: selected '{last_valid[1][:50]}' (last option)")
+                answered += 1
+        except Exception:
+            continue
+
+    # Unanswered fieldset radio groups
+    for fs in page.locator("fieldset").all():
+        try:
+            legend = fs.locator("legend").first
+            q_txt = _safe_text(legend, timeout_ms=300)
+            # Check if already answered
+            checked = fs.locator('input[type="radio"]:checked')
+            if checked.count() > 0:
+                continue
+            # Pick the last radio option
+            radios = fs.locator('input[type="radio"]').all()
+            if radios:
+                last_radio = radios[-1]
+                last_label_text = ""
+                try:
+                    parent_label = last_radio.locator("..")
+                    last_label_text = _safe_text(parent_label, timeout_ms=200)
+                except Exception:
+                    pass
+                last_radio.click()
+                print(f"      Last-option fallback (radio): '{last_label_text[:50]}' for Q: {q_txt[:40]}")
+                answered += 1
+                time.sleep(0.3)
+        except Exception:
+            continue
+
+    # Unanswered checkbox groups: check the last checkbox
+    for group in _find_checkbox_groups(page):
+        try:
+            if _is_checkbox_group_answered(page, group["name"]):
+                continue
+            # Find all checkboxes in this group and click the last one
+            cbs = page.locator(f'input[type="checkbox"][name="{group["name"]}"]').all()
+            if cbs:
+                last_cb = cbs[-1]
+                last_label_text = ""
+                try:
+                    lbl = last_cb.locator("xpath=ancestor::label")
+                    if lbl.count() > 0:
+                        last_label_text = _safe_text(lbl.first, timeout_ms=200)
+                except Exception:
+                    pass
+                last_cb.click()
+                print(f"      Last-option fallback (checkbox): '{last_label_text[:50]}' for Q: {group['question_text'][:40]}")
+                answered += 1
+                time.sleep(0.3)
+        except Exception:
+            continue
 
     print(f"    Answered {answered} screening question(s)")
     time.sleep(1)
@@ -1071,6 +1279,8 @@ def fill_apply_form(page) -> dict[str, Any]:
     }
 
     max_steps = 8
+    consecutive_same_page = 0
+    last_page_type = None
 
     for step in range(max_steps):
         time.sleep(2)
@@ -1079,6 +1289,19 @@ def fill_apply_form(page) -> dict[str, Any]:
         print(f"  Step {step + 1}: detected = {page_type}")
 
         current_url = page.url
+
+        # Detect screening loop: if same page type appears 3+ times, break
+        if page_type == last_page_type and page_type in ("screening", "unknown"):
+            consecutive_same_page += 1
+            if consecutive_same_page >= 3:
+                error_text = _check_validation_errors(page)
+                reason = error_text[:60] if error_text else f"stuck on {page_type}"
+                print(f"    Loop detected: {page_type} repeated {consecutive_same_page} times. Reason: {reason}")
+                result["steps_failed"].append(f"loop:{reason}")
+                break
+        else:
+            consecutive_same_page = 1
+            last_page_type = page_type
 
         if page_type == "submit":
             success = _handle_submit_page(page)
@@ -1094,6 +1317,14 @@ def fill_apply_form(page) -> dict[str, Any]:
             if error_text:
                 print(f"    Validation error: {error_text[:80]}")
                 result["steps_failed"].append(f"validation:{error_text[:60]}")
+                break
+            # Check if page has any form elements at all
+            has_form = page.evaluate("""() => {
+                return document.querySelectorAll('select, input[type=radio], fieldset, form').length > 0;
+            }""")
+            if not has_form:
+                print("    Unknown page with no form elements - likely expired/removed job")
+                result["steps_failed"].append("empty_apply_page")
                 break
             print("    Unknown page, trying Continue anyway...")
             success = _click_continue(page, "unknown")
