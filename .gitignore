@@ -1,0 +1,43 @@
+# Sensitive files - DO NOT commit
+config.ini
+session.json
+
+# Browser profile data
+browser_data/
+chrome_debug_profile/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Backup files
+*.bak
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+nul
+
+# IDE / tools
+.vscode/
+.idea/
+.workbuddy/
+*.swp
+*.swo
+
+# Temporary/diagnostic scripts
+diagnose*.py
+test_*.py
+test_*.txt
+dump_*.py
